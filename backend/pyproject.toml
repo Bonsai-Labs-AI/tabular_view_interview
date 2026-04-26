@@ -1,0 +1,22 @@
+[tool.poetry]
+name = "async-arbitrator"
+version = "0.1.0"
+description = "Async Arbitrator Table Fill — Interview Project"
+authors = []
+package-mode = false
+
+[tool.poetry.dependencies]
+python = "^3.11"
+fastapi = "^0.111.0"
+uvicorn = {extras = ["standard"], version = "^0.30.0"}
+sqlalchemy = {extras = ["asyncio"], version = "^2.0.0"}
+aiosqlite = "^0.20.0"
+openai = "^1.30.0"
+tavily-python = "^0.3.0"
+python-dotenv = "^1.0.0"
+pydantic = "^2.7.0"
+pydantic-settings = "^2.3.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

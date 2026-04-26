@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+
+# Env & secrets
+.env
+*.env
+
+# Database
+*.db
+*.db-shm
+*.db-wal
+
+# Frontend
+node_modules/
+dist/
+.vite/
+
+# OS
+.DS_Store

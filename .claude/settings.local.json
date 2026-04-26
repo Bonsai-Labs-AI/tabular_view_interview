@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(poetry install *)",
+      "Bash(npm install *)",
+      "Bash(pip install *)",
+      "Bash(/home/vscode/.local/bin/poetry install *)",
+      "Bash(/home/vscode/.local/bin/poetry run *)",
+      "Bash(npx tsc *)",
+      "Bash(/home/vscode/.local/bin/poetry add *)",
+      "Bash(/home/vscode/.local/bin/poetry remove *)",
+      "Bash(curl -s http://localhost:8000/tables/nonexistent)",
+      "Bash(python3 -m json.tool echo \"---db---\" ls -lh arbitrator.db)",
+      "Bash(python3 -m json.tool)",
+      "Bash(pkill -f \"uvicorn app.main:app\")",
+      "Bash(echo \"PID=$!\")",
+      "Bash(fuser 8000/tcp)",
+      "Bash(echo \"Server PID=$!\")",
+      "Read(//tmp/**)",
+      "Bash(xargs -I{} cat /proc/{}/cmdline)",
+      "Bash(fuser *)",
+      "Bash(curl -s http://localhost:8000/)",
+      "Bash(curl -s --max-time 3 http://127.0.0.1:8000/docs)",
+      "Bash(curl *)",
+      "Bash(pkill -f \"uvicorn app.main\")",
+      "Bash(kill 20378)",
+      "Bash(git -C /workspaces/tabular_view/backend remote -v)",
+      "Bash(git -C /workspaces/tabular_view/backend log --oneline)",
+      "Bash(git *)"
+    ]
+  }
+}
