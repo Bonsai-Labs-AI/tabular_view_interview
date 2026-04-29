@@ -1,0 +1,9 @@
+__pycache__
+*.pyc
+.venv
+.env
+arbitrator.db
+arbitrator.db-shm
+arbitrator.db-wal
+.pytest_cache
+.mypy_cache

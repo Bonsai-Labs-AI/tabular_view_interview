@@ -1,11 +1,24 @@
 # Async Arbitrator Table Fill
 
-## Quickstart
+## Quickstart (Docker)
+
+Only Docker is required — no local Python or Node setup.
+
+```bash
+cp backend/.env.example backend/.env   # fill in OPENAI_API_KEY and TAVILY_API_KEY
+docker compose up --build
+```
+
+Open http://localhost:5173
+
+Source code is bind-mounted, so edits to `backend/app/**` and `frontend/src/**` hot-reload inside the containers. The SQLite database is ephemeral — it's recreated each time the backend container starts.
+
+## Quickstart (local, optional)
 
 ### Backend
 ```bash
 cd backend
-cp .env.example .env          # fill in OPENAI_API_KEY and TAVILY_API_KEY
+cp .env.example .env
 poetry install
 poetry run uvicorn app.main:app --port 8765 --reload
 ```
