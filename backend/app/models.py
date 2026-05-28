@@ -41,9 +41,7 @@ class Cell(Base):
     id = Column(String, primary_key=True, default=_new_id)
     table_id = Column(String, ForeignKey("tables.id"), nullable=False)
     row_id = Column(String, ForeignKey("rows.id"), nullable=False)
-    # References column by display name rather than stable id.
-    # Efficient for reads since name is what the UI shows anyway.
-    column_name = Column(String, nullable=False)
+    column_id = Column(String, ForeignKey("columns.id"), nullable=False)
     status = Column(String, default="pending")  # pending | working | done | failed
     value = Column(String)
     confidence = Column(String)

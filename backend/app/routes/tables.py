@@ -126,7 +126,7 @@ async def create_table(req: CreateTableRequest, db: AsyncSession = Depends(get_d
             cell = Cell(
                 table_id=table.id,
                 row_id=row.id,
-                column_name=col.name,  # stored by name, not id
+                column_id=col.id,
                 status="pending",
             )
             db.add(cell)

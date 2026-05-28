@@ -55,7 +55,7 @@ class Source(BaseModel):
 class CellOut(BaseModel):
     id: str
     row_id: str
-    column_name: str
+    column_id: str
     status: str
     value: Optional[str] = None
     confidence: Optional[str] = None

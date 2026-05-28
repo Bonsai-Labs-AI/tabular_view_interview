@@ -12,8 +12,8 @@ interface CellDetail {
   cell: Cell;
 }
 
-function getCell(table: ResearchTable, rowId: string, columnName: string): Cell | undefined {
-  return table.cells.find((c) => c.row_id === rowId && c.column_name === columnName);
+function getCell(table: ResearchTable, rowId: string, columnId: string): Cell | undefined {
+  return table.cells.find((c) => c.row_id === rowId && c.column_id === columnId);
 }
 
 function CellStatusBadge({ status }: { status: Cell["status"] }) {
@@ -104,7 +104,7 @@ export default function ResearchTableView({ table, onStart }: Props) {
                   {row.name}
                 </td>
                 {table.columns.map((col) => {
-                  const cell = getCell(table, row.id, col.name);
+                  const cell = getCell(table, row.id, col.id);
                   return (
                     <td
                       key={col.id}

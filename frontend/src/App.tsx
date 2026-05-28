@@ -108,11 +108,8 @@ export default function App() {
 }
 
 function applySSEEvent(table: ResearchTable, event: SSEEvent): ResearchTable {
-  const column = table.columns.find((c) => c.id === event.columnId);
-  if (!column) return table;
-
   const updatedCells = table.cells.map((cell) => {
-    if (cell.row_id !== event.rowId || cell.column_name !== column.name) return cell;
+    if (cell.row_id !== event.rowId || cell.column_id !== event.columnId) return cell;
 
     if (event.type === "cell_working") {
       return { ...cell, status: "working" as const };

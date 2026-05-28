@@ -21,7 +21,7 @@ export interface Source {
 export interface Cell {
   id: string;
   row_id: string;
-  column_name: string;
+  column_id: string;
   status: "pending" | "working" | "done" | "failed";
   value?: string;
   confidence?: "low" | "medium" | "high";
