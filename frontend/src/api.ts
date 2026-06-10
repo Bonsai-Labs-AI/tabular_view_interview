@@ -1,4 +1,4 @@
-import { Column, ResearchTable } from "./types";
+import { ArbitratorDocument, Column, ResearchTable } from "./types";
 
 const BASE = "http://localhost:8765";
 
@@ -42,4 +42,12 @@ export async function startTable(tableId: string): Promise<void> {
 
 export function openSSE(tableId: string): EventSource {
   return new EventSource(`${BASE}/tables/${tableId}/events`);
+}
+
+export async function listDocuments(arbitratorId: string): Promise<ArbitratorDocument[]> {
+  const res = await fetch(
+    `${BASE}/documents?arbitrator_id=${encodeURIComponent(arbitratorId)}`
+  );
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
 }

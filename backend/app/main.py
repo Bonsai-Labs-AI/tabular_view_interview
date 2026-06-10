@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .database import init_db
-from .routes import tables
+from .routes import documents, tables
 
 
 @asynccontextmanager
@@ -23,3 +23,4 @@ app.add_middleware(
 )
 
 app.include_router(tables.router, prefix="/tables", tags=["tables"])
+app.include_router(documents.router, prefix="/documents", tags=["documents"])

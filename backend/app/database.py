@@ -25,8 +25,10 @@ class Base(DeclarativeBase):
 
 async def init_db():
     from . import models  # noqa: F401
+    from .seed_documents import seed_documents
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    await seed_documents()
 
 
 async def get_db():

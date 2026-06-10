@@ -47,3 +47,13 @@ class Cell(Base):
     confidence = Column(String)
     reasoning = Column(String)
     sources = Column(JSON)
+
+
+class Document(Base):
+    __tablename__ = "documents"
+
+    id = Column(String, primary_key=True, default=_new_id)
+    arbitrator_id = Column(String, nullable=False, index=True)
+    doc_type = Column(String, nullable=False)
+    filename = Column(String, nullable=False)
+    content = Column(String, nullable=False)

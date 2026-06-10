@@ -1,5 +1,6 @@
-import { useState } from "react";
-import { Cell, Column, ResearchTable, Row, Source } from "../types";
+import { useEffect, useState } from "react";
+import { listDocuments } from "../api";
+import { ArbitratorDocument, Cell, Column, ResearchTable, Row, Source } from "../types";
 
 interface Props {
   table: ResearchTable;
@@ -42,6 +43,7 @@ function ConfidenceDot({ confidence }: { confidence?: string }) {
 
 export default function ResearchTableView({ table, onStart }: Props) {
   const [detail, setDetail] = useState<CellDetail | null>(null);
+  const [docsFor, setDocsFor] = useState<Row | null>(null);
   const isRunning = table.status === "running";
 
   const pendingCount = table.cells.filter((c) => c.status === "pending").length;
@@ -101,7 +103,19 @@ export default function ResearchTableView({ table, onStart }: Props) {
             {table.rows.map((row) => (
               <tr key={row.id} className="hover:bg-gray-50">
                 <td className="sticky left-0 bg-white px-4 py-3 text-sm font-medium text-gray-900 whitespace-nowrap">
-                  {row.name}
+                  <div className="flex items-center gap-2">
+                    <span>{row.name}</span>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setDocsFor(row);
+                      }}
+                      title="View source documents"
+                      className="text-gray-400 hover:text-blue-600 text-xs"
+                    >
+                      &#128196;
+                    </button>
+                  </div>
                 </td>
                 {table.columns.map((col) => {
                   const cell = getCell(table, row.id, col.id);
@@ -147,6 +161,96 @@ export default function ResearchTableView({ table, onStart }: Props) {
       {detail && (
         <CellDetailModal detail={detail} onClose={() => setDetail(null)} />
       )}
+
+      {docsFor && (
+        <DocsModal row={docsFor} onClose={() => setDocsFor(null)} />
+      )}
+    </div>
+  );
+}
+
+function DocsModal({ row, onClose }: { row: Row; onClose: () => void }) {
+  const [docs, setDocs] = useState<ArbitratorDocument[]>([]);
+  const [activeDoc, setActiveDoc] = useState<ArbitratorDocument | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    listDocuments(row.id)
+      .then((d) => {
+        if (cancelled) return;
+        setDocs(d);
+        if (d.length > 0) setActiveDoc(d[0]);
+      })
+      .catch((e) => {
+        if (!cancelled) setError(String(e));
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [row.id]);
+
+  return (
+    <div
+      className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4"
+      onClick={onClose}
+    >
+      <div
+        className="bg-white rounded-xl shadow-xl max-w-4xl w-full max-h-[80vh] flex flex-col"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="px-6 py-4 border-b border-gray-100 flex items-center justify-between">
+          <div>
+            <p className="text-xs text-gray-500">Source documents</p>
+            <h3 className="font-semibold text-gray-900">{row.name}</h3>
+          </div>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-600">
+            <svg className="w-5 h-5" viewBox="0 0 20 20" fill="currentColor">
+              <path fillRule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clipRule="evenodd" />
+            </svg>
+          </button>
+        </div>
+
+        <div className="flex-1 flex overflow-hidden">
+          {loading && <div className="p-6 text-sm text-gray-500">Loading...</div>}
+          {error && <div className="p-6 text-sm text-red-600">{error}</div>}
+          {!loading && !error && docs.length === 0 && (
+            <div className="p-6 text-sm text-gray-500">No documents available.</div>
+          )}
+          {!loading && !error && docs.length > 0 && (
+            <>
+              <ul className="w-56 border-r border-gray-100 overflow-y-auto">
+                {docs.map((d) => (
+                  <li key={d.id}>
+                    <button
+                      onClick={() => setActiveDoc(d)}
+                      className={`w-full text-left px-4 py-2.5 text-sm border-b border-gray-50 hover:bg-gray-50 ${
+                        activeDoc?.id === d.id
+                          ? "bg-blue-50 text-blue-700 font-medium"
+                          : "text-gray-700"
+                      }`}
+                    >
+                      {d.doc_type.replace(/_/g, " ")}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+              <div className="flex-1 overflow-y-auto p-6">
+                {activeDoc && (
+                  <pre className="whitespace-pre-wrap text-sm text-gray-800 leading-relaxed font-sans">
+                    {activeDoc.content}
+                  </pre>
+                )}
+              </div>
+            </>
+          )}
+        </div>
+      </div>
     </div>
   );
 }

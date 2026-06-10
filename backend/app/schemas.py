@@ -76,3 +76,13 @@ class TableOut(BaseModel):
 
 class RenameColumnRequest(BaseModel):
     name: str
+
+
+class DocumentOut(BaseModel):
+    id: str
+    arbitrator_id: str
+    doc_type: str
+    filename: str
+    content: str
+
+    model_config = {"from_attributes": True}

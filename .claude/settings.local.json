@@ -26,7 +26,20 @@
       "Bash(kill 20378)",
       "Bash(git -C /workspaces/tabular_view/backend remote -v)",
       "Bash(git -C /workspaces/tabular_view/backend log --oneline)",
-      "Bash(git *)"
+      "Bash(git *)",
+      "Bash(poetry run *)",
+      "Bash(echo \"Backend PID: $!\")",
+      "Bash(npm run *)",
+      "Bash(echo \"Frontend PID: $!\")",
+      "Bash(echo \"EXIT: $?\")",
+      "Bash(pkill -f \"uvicorn\\\\|vite\")",
+      "Bash(fuser -k 8000/tcp)",
+      "Bash(pkill -f uvicorn)",
+      "Bash(pipx list *)",
+      "Bash(pipx install *)",
+      "Bash(docker --version)",
+      "Bash(docker compose *)",
+      "Bash(git:*)"
     ]
   }
 }

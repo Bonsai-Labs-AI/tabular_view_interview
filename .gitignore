@@ -21,3 +21,10 @@ dist/
 
 # OS
 .DS_Store
+
+# Interview prep (not for the candidate-facing repo)
+/INTERVIEW_CHEATSHEET.*
+/certification_questions.txt
+
+# Runtime logs
+/compose.log

@@ -61,3 +61,11 @@ export interface CellFailedEvent {
 }
 
 export type SSEEvent = CellWorkingEvent | CellDoneEvent | CellFailedEvent;
+
+export interface ArbitratorDocument {
+  id: string;
+  arbitrator_id: string;
+  doc_type: string;
+  filename: string;
+  content: string;
+}

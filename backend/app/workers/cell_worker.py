@@ -1,15 +1,17 @@
 import asyncio
 import json
 import logging
-from typing import Any
+from typing import Any, Literal
 
 from openai import AsyncOpenAI
+from pydantic import BaseModel, Field
+from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 
 from .. import sse
 from ..config import settings
 from ..database import async_session
-from ..models import Cell, Row, Table, TableColumn
+from ..models import Cell, Document, Row, Table, TableColumn
 
 MAX_SEARCH_ITERATIONS = 3
 MAX_CELL_RETRIES = 2
@@ -19,12 +21,33 @@ _API_CONCURRENCY = 4
 _API_ACQUIRE_TIMEOUT = 20  # seconds to wait for an API slot
 _api_gate = asyncio.Semaphore(_API_CONCURRENCY)
 
-# Track the latest result per (table, column) so concurrent agent runs can
-# converge on a consistent view of the column's current answer.
-_column_outputs: dict[tuple[str, str], dict] = {}
-
 _log = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Schemas
+# ---------------------------------------------------------------------------
+
+class _AnswerSource(BaseModel):
+    title: str = Field(..., min_length=1)
+    url: str = Field(..., min_length=1)
+
+
+class _AnswerPayload(BaseModel):
+    answer: str = Field(..., min_length=1)
+    confidence: Literal["low", "medium", "high"]
+    reasoning: str = Field(..., min_length=1)
+    sources: list[_AnswerSource] = Field(..., min_length=1)
+
+
+class _SubagentFindings(BaseModel):
+    summary: str = Field(..., min_length=1)
+    sources: list[_AnswerSource] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Tool primitives
+# ---------------------------------------------------------------------------
 
 async def _web_search(query: str) -> list[dict]:
     from tavily import TavilyClient
@@ -39,146 +62,344 @@ async def _web_search(query: str) -> list[dict]:
     ]
 
 
-# ---------------------------------------------------------------------------
-# Research context — encapsulates per-worker state for the agentic loop
-# ---------------------------------------------------------------------------
-
-class _ResearchContext:
-    """Manages research state and tool interactions for a single cell worker."""
-
-    # Tracks past search queries to provide context continuity across
-    # related research tasks targeting the same column.
-    _search_history: list[dict] = []
-
-    def __init__(
-        self,
-        row_name: str,
-        column_name: str,
-        column_description: str,
-        output_type: str,
-        research_goal: str,
-    ):
-        self.row_name = row_name
-        self.column_name = column_name
-        self.column_description = column_description
-        self.output_type = output_type
-        self.research_goal = research_goal
-        self.search_count = 0
-        self.messages: list[Any] = []
-        self._init_messages()
-
-    # -- prompt setup -------------------------------------------------------
-
-    def _init_messages(self):
-        system = (
-            f"You are a research assistant filling a cell in a comparison table.\n"
-            f"Overall research goal: {self.research_goal}\n\n"
-            f"Current task: research '{self.column_name}' for {self.row_name}.\n"
-            f"Column description: {self.column_description}\n"
-            f"Expected answer type: {self.output_type}\n\n"
-            f"Use web_search to gather information (up to {MAX_SEARCH_ITERATIONS} searches), "
-            f"then call submit_answer with your findings."
+async def _read_document(arbitrator_id: str, doc_type: str) -> str | None:
+    async with async_session() as db:
+        result = await db.execute(
+            select(Document).where(
+                Document.arbitrator_id == arbitrator_id,
+                Document.doc_type == doc_type,
+            )
         )
-        # Enrich the prompt with established context for this column so the
-        # model can build on prior findings instead of starting from scratch.
-        prior = self._related_context()
-        if prior:
-            system += f"\n\nEstablished context for this column:\n{prior}"
-
-        self.messages = [
-            {"role": "system", "content": system},
-            {
-                "role": "user",
-                "content": f"Research '{self.column_name}' for arbitrator: {self.row_name}",
-            },
-        ]
-
-    def _related_context(self) -> str:
-        """Surface key excerpts from prior research on this column."""
-        related = [e for e in self._search_history if e["column"] == self.column_name]
-        if not related:
-            return ""
-        lines: list[str] = []
-        for entry in related[-3:]:
-            for excerpt in entry.get("excerpts", []):
-                lines.append(f"- {excerpt}")
-        return "\n".join(lines)
-
-    # -- search bookkeeping -------------------------------------------------
-
-    def record_search(self, query: str, results: list[dict]):
-        """Record a completed web search and capture key excerpts for context."""
-        self.search_count += 1
-        self._search_history.append({
-            "column": self.column_name,
-            "query": query,
-            "excerpts": [r["content"][:240] for r in results[:2]],
-        })
-
-    @property
-    def can_search(self) -> bool:
-        return self.search_count < MAX_SEARCH_ITERATIONS
-
-    @property
-    def searches_exhausted(self) -> bool:
-        return self.search_count >= MAX_SEARCH_ITERATIONS
+        doc = result.scalar_one_or_none()
+        return doc.content if doc else None
 
 
 # ---------------------------------------------------------------------------
-# Shared tool definitions (constant across all workers)
+# Tool definitions
 # ---------------------------------------------------------------------------
 
-_TOOLS: list[Any] = [
-    {
-        "type": "function",
-        "function": {
-            "name": "web_search",
-            "description": "Search the web for information about the arbitrator",
-            "parameters": {
-                "type": "object",
-                "properties": {"query": {"type": "string"}},
-                "required": ["query"],
-            },
+_WEB_SEARCH_TOOL: dict = {
+    "type": "function",
+    "function": {
+        "name": "web_search",
+        "description": "Search for information about the arbitrator from web sources.",
+        "parameters": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
         },
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "submit_answer",
-            "description": "Submit the final researched answer for this cell",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "answer": {"type": "string"},
-                    "confidence": {
-                        "type": "string",
-                        "enum": ["low", "medium", "high"],
-                    },
-                    "reasoning": {"type": "string"},
-                    "sources": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "title": {"type": "string"},
-                                "url": {"type": "string"},
-                            },
-                            "required": ["title", "url"],
+}
+
+_READ_DOCUMENT_TOOL: dict = {
+    "type": "function",
+    "function": {
+        "name": "read_document",
+        "description": "Search for information about the arbitrator from their document records.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "doc_type": {
+                    "type": "string",
+                    "enum": [
+                        "cv",
+                        "opinion_or_award",
+                        "news_article",
+                        "interview_transcript",
+                        "panel_announcement",
+                    ],
+                },
+            },
+            "required": ["doc_type"],
+        },
+    },
+}
+
+_SUBMIT_FINDINGS_TOOL: dict = {
+    "type": "function",
+    "function": {
+        "name": "submit_findings",
+        "description": "Submit your research findings",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string"},
+                "sources": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string"},
+                            "url": {"type": "string"},
                         },
+                        "required": ["title", "url"],
                     },
                 },
-                "required": ["answer", "confidence", "reasoning", "sources"],
             },
+            "required": ["summary", "sources"],
         },
     },
-]
+}
+
+_SUBMIT_ANSWER_TOOL: dict = {
+    "type": "function",
+    "function": {
+        "name": "submit_answer",
+        "description": "Submit the final researched answer for this cell",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "answer": {"type": "string"},
+                "confidence": {
+                    "type": "string",
+                    "enum": ["low", "medium", "high"],
+                },
+                "reasoning": {"type": "string"},
+                "sources": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string"},
+                            "url": {"type": "string"},
+                        },
+                        "required": ["title", "url"],
+                    },
+                },
+            },
+            "required": ["answer", "confidence", "reasoning", "sources"],
+        },
+    },
+}
+
+_SUBAGENT_TOOLS: list[Any] = [_WEB_SEARCH_TOOL, _READ_DOCUMENT_TOOL, _SUBMIT_FINDINGS_TOOL]
 
 
 # ---------------------------------------------------------------------------
-# Agentic research loop
+# Shared subagent loop runner
+# ---------------------------------------------------------------------------
+
+async def _run_subagent(
+    client: AsyncOpenAI,
+    system: str,
+    user: str,
+    arbitrator_id: str,
+) -> _SubagentFindings:
+    messages: list[Any] = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+    search_count = 0
+
+    while True:
+        response = await client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=messages,
+            tools=_SUBAGENT_TOOLS,
+        )
+        msg = response.choices[0].message
+        messages.append(msg)
+
+        if not msg.tool_calls:
+            content = msg.content or "No findings."
+            return _SubagentFindings(summary=content, sources=[])
+
+        tool_results: list[Any] = []
+        submitted: _SubagentFindings | None = None
+        for tc in msg.tool_calls:
+            args = json.loads(tc.function.arguments)
+
+            if tc.function.name == "submit_findings":
+                submitted = _SubagentFindings.model_validate(args)
+                break
+
+            if tc.function.name == "web_search":
+                if search_count >= MAX_SEARCH_ITERATIONS:
+                    content = "Web search limit reached. Call submit_findings now."
+                else:
+                    results = await _web_search(args["query"])
+                    search_count += 1
+                    content = "\n\n".join(
+                        f"**{r['title']}**\n{r['url']}\n{r['content']}"
+                        for r in results
+                    )
+                tool_results.append(
+                    {"role": "tool", "tool_call_id": tc.id, "content": content}
+                )
+            elif tc.function.name == "read_document":
+                doc_content = await _read_document(arbitrator_id, args["doc_type"])
+                if doc_content is None:
+                    content = (
+                        f"No document of type '{args['doc_type']}' available. "
+                        "Try a different doc_type."
+                    )
+                else:
+                    content = doc_content
+                tool_results.append(
+                    {"role": "tool", "tool_call_id": tc.id, "content": content}
+                )
+            else:
+                tool_results.append(
+                    {"role": "tool", "tool_call_id": tc.id, "content": "Unknown tool."}
+                )
+
+        if submitted is not None:
+            return submitted
+
+        messages.extend(tool_results)
+
+        if search_count >= MAX_SEARCH_ITERATIONS:
+            forced = await client.chat.completions.create(
+                model="gpt-4.1-mini",
+                messages=messages,
+                tools=_SUBAGENT_TOOLS,
+                tool_choice={
+                    "type": "function",
+                    "function": {"name": "submit_findings"},
+                },
+            )
+            forced_tc = forced.choices[0].message.tool_calls[0]
+            return _SubagentFindings.model_validate(
+                json.loads(forced_tc.function.arguments)
+            )
+
+
+# ---------------------------------------------------------------------------
+# Planner
+# ---------------------------------------------------------------------------
+
+async def _run_planner(
+    client: AsyncOpenAI,
+    arbitrator_name: str,
+    column_name: str,
+    column_description: str,
+    output_type: str,
+    research_goal: str,
+) -> str:
+    response = await client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[
+            {
+                "role": "system",
+                "content": "You plan research strategies for a comparison table. Be brief.",
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Research goal: {research_goal}\n"
+                    f"Arbitrator: {arbitrator_name}\n"
+                    f"Column to fill: {column_name} ({output_type})\n"
+                    f"Column description: {column_description}\n\n"
+                    "Output a brief plan (2-3 sentences): which sources should we consult "
+                    "(web, documents, or both)? What specific things to look for?"
+                ),
+            },
+        ],
+    )
+    return response.choices[0].message.content or ""
+
+
+# ---------------------------------------------------------------------------
+# Web search + document analysis subagents
+# ---------------------------------------------------------------------------
+
+async def _run_web_subagent(
+    client: AsyncOpenAI,
+    plan: str,
+    arbitrator_id: str,
+    arbitrator_name: str,
+    column_name: str,
+    column_description: str,
+    output_type: str,
+) -> _SubagentFindings:
+    system = (
+        "You are a web search specialist. Find information about the arbitrator from "
+        "web sources.\n\n"
+        f"Plan from coordinator:\n{plan}"
+    )
+    user = (
+        f"Arbitrator: {arbitrator_name}\n"
+        f"Column: {column_name} ({output_type}) - {column_description}\n\n"
+        f"Use web_search (up to {MAX_SEARCH_ITERATIONS} queries), then submit_findings."
+    )
+    return await _run_subagent(client, system, user, arbitrator_id)
+
+
+async def _run_doc_subagent(
+    client: AsyncOpenAI,
+    plan: str,
+    arbitrator_id: str,
+    arbitrator_name: str,
+    column_name: str,
+    column_description: str,
+    output_type: str,
+) -> _SubagentFindings:
+    system = (
+        "You are a document analysis specialist. Find information about the arbitrator "
+        "from their documents.\n\n"
+        f"Plan from coordinator:\n{plan}"
+    )
+    user = (
+        f"Arbitrator: {arbitrator_name}\n"
+        f"Column: {column_name} ({output_type}) - {column_description}\n\n"
+        "Read the arbitrator's documents (cv, opinion_or_award, news_article, "
+        "interview_transcript, panel_announcement), then submit_findings."
+    )
+    return await _run_subagent(client, system, user, arbitrator_id)
+
+
+# ---------------------------------------------------------------------------
+# Synthesis
+# ---------------------------------------------------------------------------
+
+async def _run_synthesis(
+    client: AsyncOpenAI,
+    web_findings: _SubagentFindings,
+    doc_findings: _SubagentFindings,
+    arbitrator_name: str,
+    column_name: str,
+    column_description: str,
+    output_type: str,
+) -> dict:
+    summaries_text = (
+        f"Web findings: {web_findings.summary}\n\n"
+        f"Document findings: {doc_findings.summary}"
+    )
+    response = await client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You synthesize research findings into a final answer for a "
+                    "comparison table cell."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Arbitrator: {arbitrator_name}\n"
+                    f"Column: {column_name} ({output_type}) - {column_description}\n\n"
+                    f"{summaries_text}\n\n"
+                    "Call submit_answer with the final answer."
+                ),
+            },
+        ],
+        tools=[_SUBMIT_ANSWER_TOOL],
+        tool_choice={"type": "function", "function": {"name": "submit_answer"}},
+    )
+    tc = response.choices[0].message.tool_calls[0]
+    return _AnswerPayload.model_validate(
+        json.loads(tc.function.arguments)
+    ).model_dump()
+
+
+# ---------------------------------------------------------------------------
+# Coordinator
 # ---------------------------------------------------------------------------
 
 async def _run_agent(
+    arbitrator_id: str,
     row_name: str,
     column_name: str,
     column_description: str,
@@ -188,93 +409,51 @@ async def _run_agent(
     # Block on the shared API gate so we don't exceed provider concurrency.
     await asyncio.wait_for(_api_gate.acquire(), timeout=_API_ACQUIRE_TIMEOUT)
     try:
-        return await _run_agent_inner(
-            row_name=row_name,
+        client = AsyncOpenAI(api_key=settings.openai_api_key)
+
+        plan = await _run_planner(
+            client,
+            arbitrator_name=row_name,
             column_name=column_name,
             column_description=column_description,
             output_type=output_type,
             research_goal=research_goal,
         )
+
+        web_findings = await _run_web_subagent(
+            client,
+            plan=plan,
+            arbitrator_id=arbitrator_id,
+            arbitrator_name=row_name,
+            column_name=column_name,
+            column_description=column_description,
+            output_type=output_type,
+        )
+        doc_findings = await _run_doc_subagent(
+            client,
+            plan=plan,
+            arbitrator_id=arbitrator_id,
+            arbitrator_name=row_name,
+            column_name=column_name,
+            column_description=column_description,
+            output_type=output_type,
+        )
+
+        return await _run_synthesis(
+            client,
+            web_findings=web_findings,
+            doc_findings=doc_findings,
+            arbitrator_name=row_name,
+            column_name=column_name,
+            column_description=column_description,
+            output_type=output_type,
+        )
     finally:
         _api_gate.release()
 
 
-async def _run_agent_inner(
-    row_name: str,
-    column_name: str,
-    column_description: str,
-    output_type: str,
-    research_goal: str,
-) -> dict:
-    client = AsyncOpenAI(api_key=settings.openai_api_key)
-    ctx = _ResearchContext(
-        row_name=row_name,
-        column_name=column_name,
-        column_description=column_description,
-        output_type=output_type,
-        research_goal=research_goal,
-    )
-
-    while True:
-        response = await client.chat.completions.create(
-            model="gpt-4.1-mini",
-            messages=ctx.messages,
-            tools=_TOOLS,
-        )
-
-        msg = response.choices[0].message
-        ctx.messages.append(msg)
-
-        if not msg.tool_calls:
-            return {
-                "answer": msg.content or "",
-                "confidence": "low",
-                "reasoning": "",
-                "sources": [],
-            }
-
-        tool_results: list[Any] = []
-        for tc in msg.tool_calls:
-            args = json.loads(tc.function.arguments)
-
-            if tc.function.name == "submit_answer":
-                return args
-
-            if tc.function.name == "web_search" and ctx.can_search:
-                results = await _web_search(args["query"])
-                ctx.record_search(args["query"], results)
-                content = "\n\n".join(
-                    f"**{r['title']}**\n{r['url']}\n{r['content']}"
-                    for r in results
-                )
-                tool_results.append(
-                    {"role": "tool", "tool_call_id": tc.id, "content": content}
-                )
-            else:
-                tool_results.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": "Search limit reached. Call submit_answer now.",
-                })
-
-        ctx.messages.extend(tool_results)
-
-        if ctx.searches_exhausted:
-            forced = await client.chat.completions.create(
-                model="gpt-4.1-mini",
-                messages=ctx.messages,
-                tools=_TOOLS,
-                tool_choice={
-                    "type": "function",
-                    "function": {"name": "submit_answer"},
-                },
-            )
-            forced_tc = forced.choices[0].message.tool_calls[0]
-            return json.loads(forced_tc.function.arguments)
-
-
 # ---------------------------------------------------------------------------
-# Public entry-point — called once per cell via asyncio.create_task()
+# Public entry-point - called once per cell via asyncio.create_task()
 # ---------------------------------------------------------------------------
 
 async def fill_cell(cell_id: str, _retries: int = MAX_CELL_RETRIES) -> None:
@@ -297,6 +476,7 @@ async def fill_cell(cell_id: str, _retries: int = MAX_CELL_RETRIES) -> None:
         )
 
         result = await _run_agent(
+            arbitrator_id=row.id,
             row_name=row.name,
             column_name=column.name,
             column_description=column.description,
@@ -304,17 +484,13 @@ async def fill_cell(cell_id: str, _retries: int = MAX_CELL_RETRIES) -> None:
             research_goal=table.research_goal,
         )
 
-        # Reconcile with the canonical answer for this column to keep concurrent
-        # research consistent across rows.
-        final = _column_outputs.setdefault((cell.table_id, cell.column_id), result)
-
         async with async_session() as db:
             cell = await db.get(Cell, cell_id)
             cell.status = "done"
-            cell.value = final.get("answer", "")
-            cell.confidence = final.get("confidence", "low")
-            cell.reasoning = final.get("reasoning", "")
-            cell.sources = final.get("sources", [])
+            cell.value = result.get("answer", "")
+            cell.confidence = result.get("confidence", "low")
+            cell.reasoning = result.get("reasoning", "")
+            cell.sources = result.get("sources", [])
             await db.commit()
 
         await sse.publish(
