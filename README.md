@@ -71,10 +71,12 @@ The cell worker runs a four-stage agent loop per cell:
 
 1. **Planner** — gpt-4.1-mini brief plan: which sources to consult
 2. **Web subagent** — up to 3 Tavily searches, tools include `submit_findings`
-3. **Document subagent** — read local arbitrator documents (cv, opinions, news, etc.)
+3. **Document subagent** — semantic search over the arbitrator's document corpus via a local FAISS index (chunks embedded with `text-embedding-3-small`), plus a `read_document` tool for full-doc lookups
 4. **Synthesis** — final LLM call via `submit_answer` tool, produces answer + confidence + reasoning + sources
 
 The orchestrator (`app/orchestrator.py`) owns the table-level workflow: select pending cells, enqueue, flip status. The single dispatch seam (`enqueue_cell`) is where the route boundary meets Celery.
+
+The RAG layer (`app/rag/`) builds a per-arbitrator FAISS index lazily on first query; each Celery worker process maintains its own in-memory cache.
 
 ---
 

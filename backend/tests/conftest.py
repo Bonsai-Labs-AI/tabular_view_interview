@@ -33,6 +33,7 @@ from app import orchestrator as orchestrator_module  # noqa: E402
 from app import seed_documents as seed_documents_module  # noqa: E402
 from app import sse as app_sse  # noqa: E402
 from app.database import Base  # noqa: E402
+from app.rag import index as rag_index_module  # noqa: E402
 from app.routes import tables as tables_route  # noqa: E402
 from app.workers import cell_worker  # noqa: E402
 
@@ -83,6 +84,7 @@ async def patch_async_session(session_factory, monkeypatch):
     monkeypatch.setattr(app_database, "async_session", session_factory, raising=True)
     monkeypatch.setattr(cell_worker, "async_session", session_factory, raising=True)
     monkeypatch.setattr(seed_documents_module, "async_session", session_factory, raising=True)
+    monkeypatch.setattr(rag_index_module, "async_session", session_factory, raising=True)
 
     # `get_db` also uses async_session inside app.database, so patching there is
     # enough for routes that use `Depends(get_db)`. But routes/tables.py imported

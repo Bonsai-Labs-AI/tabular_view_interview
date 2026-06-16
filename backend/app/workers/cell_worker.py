@@ -12,6 +12,7 @@ from .. import sse
 from ..config import settings
 from ..database import async_session
 from ..models import Cell, Document, Row, Table, TableColumn
+from ..rag.search import semantic_search
 
 MAX_SEARCH_ITERATIONS = 3
 MAX_CELL_RETRIES = 2
@@ -176,7 +177,36 @@ _SUBMIT_ANSWER_TOOL: dict = {
     },
 }
 
-_SUBAGENT_TOOLS: list[Any] = [_WEB_SEARCH_TOOL, _READ_DOCUMENT_TOOL, _SUBMIT_FINDINGS_TOOL]
+_SEMANTIC_SEARCH_TOOL: dict = {
+    "type": "function",
+    "function": {
+        "name": "semantic_search",
+        "description": (
+            "Semantic search over the arbitrator's document corpus. Returns the "
+            "top-k most relevant chunks across all of their documents (CV, opinions, "
+            "news articles, transcripts, panel announcements, and any other files in "
+            "the corpus). Use this when you don't know which document to read."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "k": {
+                    "type": "integer",
+                    "description": "Number of chunks to return (default 5, max 10).",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+}
+
+_WEB_SUBAGENT_TOOLS: list[Any] = [_WEB_SEARCH_TOOL, _SUBMIT_FINDINGS_TOOL]
+_DOC_SUBAGENT_TOOLS: list[Any] = [
+    _SEMANTIC_SEARCH_TOOL,
+    _READ_DOCUMENT_TOOL,
+    _SUBMIT_FINDINGS_TOOL,
+]
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +218,8 @@ async def _run_subagent(
     system: str,
     user: str,
     arbitrator_id: str,
+    *,
+    tools: list[Any],
 ) -> _SubagentFindings:
     messages: list[Any] = [
         {"role": "system", "content": system},
@@ -199,7 +231,7 @@ async def _run_subagent(
         response = await client.chat.completions.create(
             model="gpt-4.1-mini",
             messages=messages,
-            tools=_SUBAGENT_TOOLS,
+            tools=tools,
         )
         msg = response.choices[0].message
         messages.append(msg)
@@ -230,6 +262,19 @@ async def _run_subagent(
                 tool_results.append(
                     {"role": "tool", "tool_call_id": tc.id, "content": content}
                 )
+            elif tc.function.name == "semantic_search":
+                k = min(int(args.get("k", 5)), 10)
+                hits = await semantic_search(arbitrator_id, args["query"], k=k)
+                if not hits:
+                    content = "No matching chunks found in the corpus."
+                else:
+                    content = "\n\n---\n\n".join(
+                        f"**{h['filename']}** (score={h['score']:.2f})\n{h['chunk']}"
+                        for h in hits
+                    )
+                tool_results.append(
+                    {"role": "tool", "tool_call_id": tc.id, "content": content}
+                )
             elif tc.function.name == "read_document":
                 doc_content = await _read_document(arbitrator_id, args["doc_type"])
                 if doc_content is None:
@@ -256,7 +301,7 @@ async def _run_subagent(
             forced = await client.chat.completions.create(
                 model="gpt-4.1-mini",
                 messages=messages,
-                tools=_SUBAGENT_TOOLS,
+                tools=tools,
                 tool_choice={
                     "type": "function",
                     "function": {"name": "submit_findings"},
@@ -336,7 +381,9 @@ async def _run_web_subagent(
         f"Column: {column_name} ({output_type}) - {column_description}\n\n"
         f"Use web_search (up to {MAX_SEARCH_ITERATIONS} queries), then submit_findings."
     )
-    return await _run_subagent(client, system, user, arbitrator_id)
+    return await _run_subagent(
+        client, system, user, arbitrator_id, tools=_WEB_SUBAGENT_TOOLS
+    )
 
 
 async def _run_doc_subagent(
@@ -350,16 +397,19 @@ async def _run_doc_subagent(
 ) -> _SubagentFindings:
     system = (
         "You are a document analysis specialist. Find information about the arbitrator "
-        "from their documents.\n\n"
+        "from their indexed document corpus.\n\n"
         f"Plan from coordinator:\n{plan}"
     )
     user = (
         f"Arbitrator: {arbitrator_name}\n"
         f"Column: {column_name} ({output_type}) - {column_description}\n\n"
-        "Read the arbitrator's documents (cv, opinion_or_award, news_article, "
-        "interview_transcript, panel_announcement), then submit_findings."
+        "Use semantic_search to find relevant chunks across the corpus. If a "
+        "chunk looks promising and you want more context, use read_document with "
+        "the appropriate doc_type. Then submit_findings."
     )
-    return await _run_subagent(client, system, user, arbitrator_id)
+    return await _run_subagent(
+        client, system, user, arbitrator_id, tools=_DOC_SUBAGENT_TOOLS
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -537,7 +587,7 @@ async def fill_cell(cell_id: str, _retries: int = MAX_CELL_RETRIES) -> None:
 
     except Exception as exc:
         if _retries > 0:
-            _log.debug("Transient failure for cell %s, retrying (%d left)", cell_id, _retries)
+            _log.warning("Transient failure for cell %s, retrying (%d left): %r", cell_id, _retries, exc)
             # Reset status so the next attempt isn't blocked by the
             # "already working" guard at the top of fill_cell.
             try:
@@ -550,6 +600,7 @@ async def fill_cell(cell_id: str, _retries: int = MAX_CELL_RETRIES) -> None:
                 _log.exception("Could not reset cell %s status before retry", cell_id)
             await asyncio.sleep(1)
             return await fill_cell(cell_id, _retries=_retries - 1)
+        _log.error("Cell %s failed terminally: %r", cell_id, exc)
         try:
             async with async_session() as db:
                 cell = await db.get(Cell, cell_id)

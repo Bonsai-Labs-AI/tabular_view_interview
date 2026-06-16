@@ -288,6 +288,7 @@ async def test_run_subagent_exits_when_turn_budget_exhausted(monkeypatch):
         system="sys",
         user="user",
         arbitrator_id="arb_1",
+        tools=cell_worker._DOC_SUBAGENT_TOOLS,
     )
     assert "exceeded turn budget" in result.summary.lower()
     assert len(fake.calls) == 3
@@ -317,3 +318,52 @@ async def test_run_synthesis_raises_when_no_tool_calls():
             column_description="background",
             output_type="short_text",
         )
+
+
+# ---------------------------------------------------------------------------
+# semantic_search tool routing in the subagent loop
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_subagent_routes_semantic_search_tool_call(monkeypatch):
+    """When the model calls semantic_search, the subagent should call the
+    semantic_search function and feed results back as the tool result, then
+    accept the model's submit_findings on the next turn.
+    """
+    captured: dict = {}
+
+    async def fake_search(arbitrator_id, query, k):
+        captured.update({"arb": arbitrator_id, "query": query, "k": k})
+        return [
+            {"filename": "cv.md", "doc_type": "cv", "chunk": "Yale 1991", "score": 0.85},
+            {"filename": "news.md", "doc_type": "news", "chunk": "Chair of ICC tribunal", "score": 0.72},
+        ]
+
+    monkeypatch.setattr(cell_worker, "semantic_search", fake_search)
+
+    responses = iter([
+        make_response(tool_calls=[make_tool_call(
+            "semantic_search",
+            {"query": "education background", "k": 3},
+            call_id="call_1",
+        )]),
+        make_response(tool_calls=[make_tool_call(
+            "submit_findings",
+            {"summary": "Yale '91; ICC chair", "sources": [{"title": "cv.md", "url": "doc://cv.md"}]},
+            call_id="call_2",
+        )]),
+    ])
+
+    fake = _ScriptedOpenAI(handler=lambda **_: next(responses))
+    result = await cell_worker._run_subagent(
+        fake,
+        system="sys",
+        user="user",
+        arbitrator_id="arb_42",
+        tools=cell_worker._DOC_SUBAGENT_TOOLS,
+    )
+
+    assert captured == {"arb": "arb_42", "query": "education background", "k": 3}
+    assert "Yale" in result.summary
+    assert len(fake.calls) == 2
