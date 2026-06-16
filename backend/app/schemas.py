@@ -18,7 +18,6 @@ class ProposeColumnsResponse(BaseModel):
 
 
 class ApprovedColumn(BaseModel):
-    id: str
     name: str
     description: str
     output_type: str
@@ -42,6 +41,7 @@ class ColumnOut(BaseModel):
 
 class RowOut(BaseModel):
     id: str
+    arbitrator_id: str
     name: str
 
     model_config = {"from_attributes": True}

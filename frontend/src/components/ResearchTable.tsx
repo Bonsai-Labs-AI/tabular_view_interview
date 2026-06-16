@@ -178,7 +178,7 @@ function DocsModal({ row, onClose }: { row: Row; onClose: () => void }) {
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
-    listDocuments(row.id)
+    listDocuments(row.arbitrator_id)
       .then((d) => {
         if (cancelled) return;
         setDocs(d);
@@ -193,7 +193,7 @@ function DocsModal({ row, onClose }: { row: Row; onClose: () => void }) {
     return () => {
       cancelled = true;
     };
-  }, [row.id]);
+  }, [row.arbitrator_id]);
 
   return (
     <div

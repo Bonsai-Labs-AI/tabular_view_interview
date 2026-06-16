@@ -1,13 +1,40 @@
 services:
+  redis:
+    image: redis:7-alpine
+
   backend:
     build: ./backend
     ports:
       - "8765:8765"
     env_file:
       - ./backend/.env
+    environment:
+      - DATABASE_URL=sqlite+aiosqlite:////db/arbitrator.db
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
     volumes:
       - ./backend/app:/app/app
       - ./data:/data:ro
+      - db_data:/db
+    depends_on:
+      - redis
+
+  worker:
+    build: ./backend
+    command: celery -A app.queue worker --loglevel=info --queues=cells --concurrency=4
+    env_file:
+      - ./backend/.env
+    environment:
+      - DATABASE_URL=sqlite+aiosqlite:////db/arbitrator.db
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+    volumes:
+      - ./backend/app:/app/app
+      - ./data:/data:ro
+      - db_data:/db
+    depends_on:
+      - redis
+      - backend
 
   frontend:
     build: ./frontend
@@ -24,3 +51,6 @@ services:
       - /app/node_modules
     depends_on:
       - backend
+
+volumes:
+  db_data:

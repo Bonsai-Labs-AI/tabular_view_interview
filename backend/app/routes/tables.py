@@ -1,6 +1,5 @@
 import asyncio
 import json
-from typing import List
 
 from openai import AsyncOpenAI
 from fastapi import APIRouter, Depends, HTTPException
@@ -8,9 +7,9 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .. import sse
+from .. import orchestrator, sse
 from ..config import settings
-from ..database import async_session, get_db
+from ..database import get_db
 from ..models import Cell, Row, Table, TableColumn
 from ..schemas import (
     CellOut,
@@ -23,7 +22,6 @@ from ..schemas import (
     RowOut,
     TableOut,
 )
-from ..workers.cell_worker import fill_cell
 
 router = APIRouter()
 
@@ -103,14 +101,13 @@ async def create_table(req: CreateTableRequest, db: AsyncSession = Depends(get_d
 
     rows = []
     for r in PREDEFINED_ROWS:
-        row = Row(id=r["id"], table_id=table.id, name=r["name"])
+        row = Row(table_id=table.id, arbitrator_id=r["id"], name=r["name"])
         db.add(row)
         rows.append(row)
 
     columns = []
     for col_def in req.columns:
         col = TableColumn(
-            id=col_def.id,
             table_id=table.id,
             name=col_def.name,
             description=col_def.description,
@@ -119,6 +116,8 @@ async def create_table(req: CreateTableRequest, db: AsyncSession = Depends(get_d
         )
         db.add(col)
         columns.append(col)
+
+    await db.flush()
 
     cells = []
     for row in rows:
@@ -171,18 +170,8 @@ async def start_table(table_id: str, db: AsyncSession = Depends(get_db)):
     if not table:
         raise HTTPException(status_code=404, detail="Table not found")
 
-    cells_result = await db.execute(select(Cell).where(Cell.table_id == table_id))
-    cells = cells_result.scalars().all()
-
-    # Dispatch one worker per cell. No status check — calling /start again
-    # creates duplicate workers for cells that are already running or done.
-    for cell in cells:
-        asyncio.create_task(fill_cell(cell.id))
-
-    table.status = "running"
-    await db.commit()
-
-    return {"status": "started", "cell_count": len(cells)}
+    count = await orchestrator.start_table(db, table)
+    return {"status": "started", "cell_count": count}
 
 
 @router.patch("/{table_id}/columns/{column_id}", response_model=ColumnOut)
@@ -203,20 +192,23 @@ async def rename_column(
 
 @router.get("/{table_id}/events")
 async def table_events(table_id: str):
-    queue = sse.subscribe(table_id)
-
     async def generate():
-        try:
+        async with sse.subscribe(table_id) as pubsub:
             while True:
                 try:
-                    event = await asyncio.wait_for(queue.get(), timeout=30.0)
-                    yield f"data: {json.dumps(event)}\n\n"
-                except asyncio.TimeoutError:
+                    msg = await pubsub.get_message(
+                        ignore_subscribe_messages=True,
+                        timeout=30.0,
+                    )
+                except asyncio.CancelledError:
+                    return
+                if msg is None:
                     yield ": ping\n\n"
-        except asyncio.CancelledError:
-            pass
-        finally:
-            sse.unsubscribe(table_id, queue)
+                    continue
+                data = msg.get("data")
+                if data is None:
+                    continue
+                yield f"data: {data}\n\n"
 
     return StreamingResponse(
         generate(),

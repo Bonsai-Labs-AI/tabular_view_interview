@@ -10,6 +10,7 @@ export interface Column {
 
 export interface Row {
   id: string;
+  arbitrator_id: string;
   name: string;
 }
 

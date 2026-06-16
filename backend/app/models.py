@@ -19,8 +19,9 @@ class Table(Base):
 class Row(Base):
     __tablename__ = "rows"
 
-    id = Column(String, primary_key=True)
+    id = Column(String, primary_key=True, default=_new_id)
     table_id = Column(String, ForeignKey("tables.id"), nullable=False)
+    arbitrator_id = Column(String, nullable=False, index=True)
     name = Column(String, nullable=False)
 
 

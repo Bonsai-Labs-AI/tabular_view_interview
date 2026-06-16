@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { createTable, proposeColumns, startTable, openSSE } from "./api";
 import { Column, ResearchTable, SSEEvent } from "./types";
 import ResearchSetup from "./components/ResearchSetup";
@@ -15,6 +15,30 @@ type Phase =
 export default function App() {
   const [phase, setPhase] = useState<Phase>({ name: "setup" });
   const [error, setError] = useState<string | null>(null);
+
+  const tableId = phase.name === "table" ? phase.table.id : null;
+  const tableStatus = phase.name === "table" ? phase.table.status : null;
+
+  // Own the EventSource via a useEffect keyed on table id + status so it is
+  // always cleaned up when the user navigates away, the component unmounts,
+  // or the table transitions out of "running".
+  useEffect(() => {
+    if (!tableId || tableStatus !== "running") return;
+
+    const es = openSSE(tableId);
+    es.onmessage = (evt) => {
+      const event: SSEEvent = JSON.parse(evt.data);
+      setPhase((prev) => {
+        if (prev.name !== "table" || prev.table.id !== tableId) return prev;
+        return { name: "table", table: applySSEEvent(prev.table, event) };
+      });
+    };
+    es.onerror = () => es.close();
+
+    return () => {
+      es.close();
+    };
+  }, [tableId, tableStatus]);
 
   async function handleGenerate(researchGoal: string) {
     setError(null);
@@ -45,17 +69,8 @@ export default function App() {
     setError(null);
     try {
       await startTable(tableId);
-
-      const es = openSSE(tableId);
-      es.onmessage = (evt) => {
-        const event: SSEEvent = JSON.parse(evt.data);
-        setPhase((prev) => {
-          if (prev.name !== "table") return prev;
-          return { name: "table", table: applySSEEvent(prev.table, event) };
-        });
-      };
-      es.onerror = () => es.close();
-
+      // Flipping status to "running" triggers the useEffect above, which
+      // opens (and later cleans up) the EventSource for us.
       setPhase((prev) =>
         prev.name === "table"
           ? { name: "table", table: { ...prev.table, status: "running" } }
@@ -107,7 +122,7 @@ export default function App() {
   );
 }
 
-function applySSEEvent(table: ResearchTable, event: SSEEvent): ResearchTable {
+export function applySSEEvent(table: ResearchTable, event: SSEEvent): ResearchTable {
   const updatedCells = table.cells.map((cell) => {
     if (cell.row_id !== event.rowId || cell.column_id !== event.columnId) return cell;
 

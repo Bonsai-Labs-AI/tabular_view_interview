@@ -15,11 +15,8 @@ from ..models import Cell, Document, Row, Table, TableColumn
 
 MAX_SEARCH_ITERATIONS = 3
 MAX_CELL_RETRIES = 2
-
-# Rate-limit concurrent OpenAI calls to respect provider quotas under load.
-_API_CONCURRENCY = 4
-_API_ACQUIRE_TIMEOUT = 20  # seconds to wait for an API slot
-_api_gate = asyncio.Semaphore(_API_CONCURRENCY)
+MAX_SUBAGENT_TURNS = 12
+_WEB_SEARCH_TIMEOUT = 20  # seconds for a single Tavily call
 
 _log = logging.getLogger(__name__)
 
@@ -53,9 +50,16 @@ async def _web_search(query: str) -> list[dict]:
     from tavily import TavilyClient
 
     client = TavilyClient(api_key=settings.tavily_api_key)
-    results = await asyncio.to_thread(
-        client.search, query, max_results=3, search_depth="basic"
-    )
+    try:
+        results = await asyncio.wait_for(
+            asyncio.to_thread(
+                client.search, query, max_results=3, search_depth="basic"
+            ),
+            timeout=_WEB_SEARCH_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        _log.warning("Web search timed out for query: %s", query)
+        return []
     return [
         {"title": r["title"], "url": r["url"], "content": r["content"]}
         for r in results.get("results", [])
@@ -191,7 +195,7 @@ async def _run_subagent(
     ]
     search_count = 0
 
-    while True:
+    for _turn in range(MAX_SUBAGENT_TURNS):
         response = await client.chat.completions.create(
             model="gpt-4.1-mini",
             messages=messages,
@@ -258,10 +262,20 @@ async def _run_subagent(
                     "function": {"name": "submit_findings"},
                 },
             )
-            forced_tc = forced.choices[0].message.tool_calls[0]
+            forced_calls = forced.choices[0].message.tool_calls or []
+            if not forced_calls:
+                return _SubagentFindings(
+                    summary="Search limit reached and no findings could be extracted.",
+                    sources=[],
+                )
             return _SubagentFindings.model_validate(
-                json.loads(forced_tc.function.arguments)
+                json.loads(forced_calls[0].function.arguments)
             )
+
+    return _SubagentFindings(
+        summary="Subagent exceeded turn budget without submitting findings.",
+        sources=[],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -388,9 +402,11 @@ async def _run_synthesis(
         tools=[_SUBMIT_ANSWER_TOOL],
         tool_choice={"type": "function", "function": {"name": "submit_answer"}},
     )
-    tc = response.choices[0].message.tool_calls[0]
+    tool_calls = response.choices[0].message.tool_calls or []
+    if not tool_calls:
+        raise RuntimeError("Synthesis model did not call submit_answer.")
     return _AnswerPayload.model_validate(
-        json.loads(tc.function.arguments)
+        json.loads(tool_calls[0].function.arguments)
     ).model_dump()
 
 
@@ -406,50 +422,45 @@ async def _run_agent(
     output_type: str,
     research_goal: str,
 ) -> dict:
-    # Block on the shared API gate so we don't exceed provider concurrency.
-    await asyncio.wait_for(_api_gate.acquire(), timeout=_API_ACQUIRE_TIMEOUT)
-    try:
-        client = AsyncOpenAI(api_key=settings.openai_api_key)
+    client = AsyncOpenAI(api_key=settings.openai_api_key)
 
-        plan = await _run_planner(
-            client,
-            arbitrator_name=row_name,
-            column_name=column_name,
-            column_description=column_description,
-            output_type=output_type,
-            research_goal=research_goal,
-        )
+    plan = await _run_planner(
+        client,
+        arbitrator_name=row_name,
+        column_name=column_name,
+        column_description=column_description,
+        output_type=output_type,
+        research_goal=research_goal,
+    )
 
-        web_findings = await _run_web_subagent(
-            client,
-            plan=plan,
-            arbitrator_id=arbitrator_id,
-            arbitrator_name=row_name,
-            column_name=column_name,
-            column_description=column_description,
-            output_type=output_type,
-        )
-        doc_findings = await _run_doc_subagent(
-            client,
-            plan=plan,
-            arbitrator_id=arbitrator_id,
-            arbitrator_name=row_name,
-            column_name=column_name,
-            column_description=column_description,
-            output_type=output_type,
-        )
+    web_findings = await _run_web_subagent(
+        client,
+        plan=plan,
+        arbitrator_id=arbitrator_id,
+        arbitrator_name=row_name,
+        column_name=column_name,
+        column_description=column_description,
+        output_type=output_type,
+    )
+    doc_findings = await _run_doc_subagent(
+        client,
+        plan=plan,
+        arbitrator_id=arbitrator_id,
+        arbitrator_name=row_name,
+        column_name=column_name,
+        column_description=column_description,
+        output_type=output_type,
+    )
 
-        return await _run_synthesis(
-            client,
-            web_findings=web_findings,
-            doc_findings=doc_findings,
-            arbitrator_name=row_name,
-            column_name=column_name,
-            column_description=column_description,
-            output_type=output_type,
-        )
-    finally:
-        _api_gate.release()
+    return await _run_synthesis(
+        client,
+        web_findings=web_findings,
+        doc_findings=doc_findings,
+        arbitrator_name=row_name,
+        column_name=column_name,
+        column_description=column_description,
+        output_type=output_type,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -466,26 +477,46 @@ async def fill_cell(cell_id: str, _retries: int = MAX_CELL_RETRIES) -> None:
             row = await db.get(Row, cell.row_id)
             table = await db.get(Table, cell.table_id)
             column = await db.get(TableColumn, cell.column_id)
+            if row is None or table is None or column is None:
+                _log.error(
+                    "Cell %s has missing row/table/column references; marking failed",
+                    cell_id,
+                )
+                cell.status = "failed"
+                await db.commit()
+                return
+
+            table_id = cell.table_id
+            row_id = row.id
+            column_id = cell.column_id
+            arbitrator_id = row.arbitrator_id
+            row_name = row.name
+            column_name = column.name
+            column_description = column.description
+            column_output_type = column.output_type
+            research_goal = table.research_goal
 
             cell.status = "working"
             await db.commit()
 
         await sse.publish(
-            cell.table_id,
-            {"type": "cell_working", "rowId": row.id, "columnId": cell.column_id},
+            table_id,
+            {"type": "cell_working", "rowId": row_id, "columnId": column_id},
         )
 
         result = await _run_agent(
-            arbitrator_id=row.id,
-            row_name=row.name,
-            column_name=column.name,
-            column_description=column.description,
-            output_type=column.output_type,
-            research_goal=table.research_goal,
+            arbitrator_id=arbitrator_id,
+            row_name=row_name,
+            column_name=column_name,
+            column_description=column_description,
+            output_type=column_output_type,
+            research_goal=research_goal,
         )
 
         async with async_session() as db:
             cell = await db.get(Cell, cell_id)
+            if cell is None:
+                return
             cell.status = "done"
             cell.value = result.get("answer", "")
             cell.confidence = result.get("confidence", "low")
@@ -493,21 +524,30 @@ async def fill_cell(cell_id: str, _retries: int = MAX_CELL_RETRIES) -> None:
             cell.sources = result.get("sources", [])
             await db.commit()
 
-        await sse.publish(
-            cell.table_id,
-            {
+            done_payload = {
                 "type": "cell_done",
-                "rowId": row.id,
-                "columnId": cell.column_id,
+                "rowId": row_id,
+                "columnId": column_id,
                 "value": cell.value,
                 "confidence": cell.confidence,
                 "sources": cell.sources or [],
-            },
-        )
+            }
 
-    except (SQLAlchemyError, Exception) as exc:
+        await sse.publish(table_id, done_payload)
+
+    except Exception as exc:
         if _retries > 0:
             _log.debug("Transient failure for cell %s, retrying (%d left)", cell_id, _retries)
+            # Reset status so the next attempt isn't blocked by the
+            # "already working" guard at the top of fill_cell.
+            try:
+                async with async_session() as db:
+                    cell = await db.get(Cell, cell_id)
+                    if cell is not None and cell.status == "working":
+                        cell.status = "pending"
+                        await db.commit()
+            except SQLAlchemyError:
+                _log.exception("Could not reset cell %s status before retry", cell_id)
             await asyncio.sleep(1)
             return await fill_cell(cell_id, _retries=_retries - 1)
         try:
@@ -525,5 +565,5 @@ async def fill_cell(cell_id: str, _retries: int = MAX_CELL_RETRIES) -> None:
                             "error": str(exc),
                         },
                     )
-        except Exception:
-            pass
+        except SQLAlchemyError:
+            _log.exception("Failed to record terminal failure for cell %s", cell_id)

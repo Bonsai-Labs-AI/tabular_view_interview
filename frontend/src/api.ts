@@ -1,6 +1,6 @@
 import { ArbitratorDocument, Column, ResearchTable } from "./types";
 
-const BASE = "http://localhost:8765";
+const BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8765";
 
 export async function proposeColumns(researchGoal: string): Promise<Column[]> {
   const res = await fetch(`${BASE}/tables/propose-columns`, {
