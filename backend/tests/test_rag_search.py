@@ -1,14 +1,18 @@
-"""Tests for app.rag.search.semantic_search."""
+"""Tests for app.rag.search.semantic_search against a built index."""
 from __future__ import annotations
 
 import hashlib
+from pathlib import Path
 
 import numpy as np
 import pytest
 
-from app import models
+from app import config as app_config
+from app.rag import build as build_module
+from app.rag import embeddings as embeddings_module
 from app.rag import index as index_module
 from app.rag import search as search_module
+from app.rag.index import IndexNotBuilt
 
 
 def _deterministic_embed(texts: list[str]) -> np.ndarray:
@@ -24,32 +28,38 @@ def _deterministic_embed(texts: list[str]) -> np.ndarray:
 
 
 @pytest.fixture(autouse=True)
-def patch_embeddings(monkeypatch):
+def patch_embeddings_and_paths(tmp_path, monkeypatch):
     async def fake_embed(texts):
         return _deterministic_embed(list(texts))
 
-    # Patch in both modules — index calls embed_texts at build time, search at query time.
-    monkeypatch.setattr(index_module, "embed_texts", fake_embed)
+    monkeypatch.setattr(embeddings_module, "embed_texts", fake_embed)
+    monkeypatch.setattr(build_module, "embed_texts", fake_embed)
     monkeypatch.setattr(search_module, "embed_texts", fake_embed)
+    monkeypatch.setattr(app_config.settings, "rag_index_dir", str(tmp_path / "rag_index"))
+    monkeypatch.setattr(build_module, "_CORPUS_ROOT", tmp_path / "documents")
+
     index_module.reset_cache()
     yield
     index_module.reset_cache()
 
 
-@pytest.mark.asyncio
-async def test_semantic_search_returns_hits_for_known_query(session_factory):
-    async with session_factory() as db:
-        db.add(models.Document(
-            arbitrator_id="arb_s",
-            doc_type="cv",
-            filename="cv.md",
-            content="Educated at Yale and Oxford.\n\nSpecializes in commercial arbitration.",
-        ))
-        await db.commit()
+def _seed(tmp_path: Path, name: str, files: dict[str, str]) -> Path:
+    p = tmp_path / "documents" / name
+    p.mkdir(parents=True)
+    for fname, content in files.items():
+        (p / fname).write_text(content, encoding="utf-8")
+    return p
 
-    # Query == exact text of one of the chunks
+
+@pytest.mark.asyncio
+async def test_semantic_search_returns_hits(tmp_path):
+    _seed(tmp_path, "arb_1_alpha", {
+        "cv.md": "Educated at Yale and Oxford.\n\nSpecializes in commercial arbitration.",
+    })
+    await build_module.build_index_for("arb_1", tmp_path / "documents" / "arb_1_alpha", force=False)
+
     hits = await search_module.semantic_search(
-        "arb_s",
+        "arb_1",
         "Educated at Yale and Oxford.\n\nSpecializes in commercial arbitration.",
         k=3,
     )
@@ -61,22 +71,16 @@ async def test_semantic_search_returns_hits_for_known_query(session_factory):
 
 
 @pytest.mark.asyncio
-async def test_semantic_search_returns_empty_when_no_corpus():
-    hits = await search_module.semantic_search("arb_missing", "anything", k=5)
-    assert hits == []
+async def test_semantic_search_raises_when_index_missing():
+    with pytest.raises(IndexNotBuilt):
+        await search_module.semantic_search("arb_missing", "anything", k=5)
 
 
 @pytest.mark.asyncio
-async def test_semantic_search_respects_k(session_factory):
-    async with session_factory() as db:
-        for i in range(8):
-            db.add(models.Document(
-                arbitrator_id="arb_k",
-                doc_type=f"doc_{i}",
-                filename=f"doc_{i}.md",
-                content=f"Unique content number {i}",
-            ))
-        await db.commit()
+async def test_semantic_search_respects_k(tmp_path):
+    files = {f"doc_{i}.md": f"Unique content number {i}" for i in range(8)}
+    _seed(tmp_path, "arb_1_alpha", files)
+    await build_module.build_index_for("arb_1", tmp_path / "documents" / "arb_1_alpha", force=False)
 
-    hits = await search_module.semantic_search("arb_k", "Unique content number 3", k=3)
+    hits = await search_module.semantic_search("arb_1", "Unique content number 3", k=3)
     assert len(hits) == 3

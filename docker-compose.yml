@@ -2,6 +2,21 @@ services:
   redis:
     image: redis:7-alpine
 
+  rag-indexer:
+    build: ./backend
+    command: python -m app.rag.build
+    env_file:
+      - ./backend/.env
+    environment:
+      - DATABASE_URL=sqlite+aiosqlite:////db/arbitrator.db
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - RAG_INDEX_DIR=/data/rag_index
+    volumes:
+      - ./backend/app:/app/app
+      - ./data:/data
+    restart: "no"
+
   backend:
     build: ./backend
     ports:
@@ -12,12 +27,16 @@ services:
       - DATABASE_URL=sqlite+aiosqlite:////db/arbitrator.db
       - REDIS_URL=redis://redis:6379/0
       - CELERY_BROKER_URL=redis://redis:6379/1
+      - RAG_INDEX_DIR=/data/rag_index
     volumes:
       - ./backend/app:/app/app
-      - ./data:/data:ro
+      - ./data:/data
       - db_data:/db
     depends_on:
-      - redis
+      redis:
+        condition: service_started
+      rag-indexer:
+        condition: service_completed_successfully
 
   worker:
     build: ./backend
@@ -28,13 +47,18 @@ services:
       - DATABASE_URL=sqlite+aiosqlite:////db/arbitrator.db
       - REDIS_URL=redis://redis:6379/0
       - CELERY_BROKER_URL=redis://redis:6379/1
+      - RAG_INDEX_DIR=/data/rag_index
     volumes:
       - ./backend/app:/app/app
-      - ./data:/data:ro
+      - ./data:/data
       - db_data:/db
     depends_on:
-      - redis
-      - backend
+      redis:
+        condition: service_started
+      backend:
+        condition: service_started
+      rag-indexer:
+        condition: service_completed_successfully
 
   frontend:
     build: ./frontend

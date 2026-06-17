@@ -1,23 +1,22 @@
-"""Per-arbitrator FAISS index built lazily and cached in process.
+"""Per-arbitrator FAISS index loaded from disk.
 
-Each Celery worker process maintains its own cache. First query for a
-given arbitrator pays the cost of loading all docs, chunking, embedding,
-and adding to FAISS. Subsequent queries hit the in-memory index.
+Indexes are built offline by `app.rag.build` and persisted under
+<rag_index_dir>/<arbitrator_id>/. At query time we load index.faiss +
+chunks.jsonl, then cache in memory per worker process for subsequent
+calls.
 """
 from __future__ import annotations
 
-import asyncio
+import json
+import threading
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import faiss
 import numpy as np
-from sqlalchemy import select
 
-from ..database import async_session
-from ..models import Document
-from .chunker import chunk_document
-from .embeddings import EMBEDDING_DIM, embed_texts
+from ..config import settings
 
 
 @dataclass(frozen=True)
@@ -29,16 +28,22 @@ class ChunkMeta:
     text: str
 
 
-class ArbitratorIndex:
-    """In-memory FAISS index over chunks for a single arbitrator."""
+class IndexNotBuilt(RuntimeError):
+    """Raised when a query hits an arbitrator whose index has not been built."""
 
-    def __init__(self, chunks: list[ChunkMeta], embeddings: np.ndarray):
+
+class ArbitratorIndex:
+    """A FAISS index plus parallel chunk metadata for a single arbitrator."""
+
+    def __init__(
+        self,
+        arbitrator_id: str,
+        chunks: list[ChunkMeta],
+        index: Optional[faiss.Index],
+    ):
+        self.arbitrator_id = arbitrator_id
         self.chunks = chunks
-        if len(chunks) == 0:
-            self.index: Optional[faiss.Index] = None
-        else:
-            self.index = faiss.IndexFlatIP(embeddings.shape[1])
-            self.index.add(embeddings)
+        self.index = index
 
     def search(self, query_embedding: np.ndarray, k: int) -> list[tuple[ChunkMeta, float]]:
         if self.index is None or len(self.chunks) == 0:
@@ -53,60 +58,55 @@ class ArbitratorIndex:
 
 
 _cache: dict[str, ArbitratorIndex] = {}
-_locks: dict[str, asyncio.Lock] = {}
+_cache_lock = threading.Lock()
 
 
-def _lock_for(arbitrator_id: str) -> asyncio.Lock:
-    if arbitrator_id not in _locks:
-        _locks[arbitrator_id] = asyncio.Lock()
-    return _locks[arbitrator_id]
+def _index_dir(arbitrator_id: str) -> Path:
+    return Path(settings.rag_index_dir) / arbitrator_id
 
 
-async def _load_chunks(arbitrator_id: str) -> tuple[list[ChunkMeta], list[str]]:
-    async with async_session() as db:
-        result = await db.execute(
-            select(Document).where(Document.arbitrator_id == arbitrator_id)
-        )
-        docs = result.scalars().all()
+def load_index(arbitrator_id: str) -> ArbitratorIndex:
+    """Load a built index from disk; cached in process for subsequent calls.
 
-    chunks: list[ChunkMeta] = []
-    texts: list[str] = []
-    for doc in docs:
-        for i, chunk in enumerate(chunk_document(doc.content)):
-            chunks.append(
-                ChunkMeta(
-                    arbitrator_id=arbitrator_id,
-                    filename=doc.filename,
-                    doc_type=doc.doc_type,
-                    chunk_index=i,
-                    text=chunk,
-                )
-            )
-            texts.append(chunk)
-    return chunks, texts
-
-
-async def get_index(arbitrator_id: str) -> ArbitratorIndex:
+    Raises IndexNotBuilt if no manifest exists for this arbitrator — the
+    operator must run `python -m app.rag.build` first.
+    """
     if arbitrator_id in _cache:
         return _cache[arbitrator_id]
 
-    async with _lock_for(arbitrator_id):
+    with _cache_lock:
         if arbitrator_id in _cache:
             return _cache[arbitrator_id]
 
-        chunks, texts = await _load_chunks(arbitrator_id)
-        if not texts:
-            empty = ArbitratorIndex([], np.zeros((0, EMBEDDING_DIM), dtype="float32"))
-            _cache[arbitrator_id] = empty
-            return empty
+        d = _index_dir(arbitrator_id)
+        manifest_path = d / "manifest.json"
+        index_path = d / "index.faiss"
+        chunks_path = d / "chunks.jsonl"
 
-        embeddings = await embed_texts(texts)
-        idx = ArbitratorIndex(chunks, embeddings)
-        _cache[arbitrator_id] = idx
-        return idx
+        if not manifest_path.exists():
+            raise IndexNotBuilt(
+                f"No RAG index found for {arbitrator_id} at {d}. "
+                "Run `python -m app.rag.build` to build it."
+            )
+
+        faiss_index = faiss.read_index(str(index_path))
+        chunks: list[ChunkMeta] = []
+        with chunks_path.open(encoding="utf-8") as f:
+            for line in f:
+                obj = json.loads(line)
+                chunks.append(ChunkMeta(
+                    arbitrator_id=arbitrator_id,
+                    filename=obj["filename"],
+                    doc_type=obj["doc_type"],
+                    chunk_index=obj["chunk_index"],
+                    text=obj["text"],
+                ))
+
+        arb_idx = ArbitratorIndex(arbitrator_id, chunks, faiss_index)
+        _cache[arbitrator_id] = arb_idx
+        return arb_idx
 
 
 def reset_cache() -> None:
     """Drop all cached indexes. Tests use this between cases."""
     _cache.clear()
-    _locks.clear()
