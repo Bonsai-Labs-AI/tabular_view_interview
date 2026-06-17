@@ -1,0 +1,8 @@
+{
+  "arbitrator_id": "arb_2",
+  "num_chunks": 393,
+  "num_documents": 13,
+  "embedding_model": "text-embedding-3-small",
+  "embedding_dim": 1536,
+  "built_at": "2026-06-17T05:38:59.559759+00:00"
+}

@@ -14,9 +14,6 @@ dist/
 *.db-shm
 *.db-wal
 
-# RAG build artifacts
-/data/rag_index/
-
 # Frontend
 node_modules/
 dist/
