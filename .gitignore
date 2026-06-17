@@ -24,7 +24,9 @@ dist/
 
 # Interview prep (not for the candidate-facing repo)
 /INTERVIEW_CHEATSHEET.*
+/INTERVIEW_SCORECARD.html
 /certification_questions.txt
+/ideas to investage/
 
 # Runtime logs
 /compose.log
